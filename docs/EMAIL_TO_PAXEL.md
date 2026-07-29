@@ -16,8 +16,8 @@ I hit two issues running `upload.sh` on a large project and wanted to send them
 over with reproductions. One of them produces a wrong report rather than a failed
 run, which seems worth prioritising.
 
-My test case: 1,102 commits, 4,578 Claude Code transcripts, 950 MB of session
-data. Tested against `upload.sh` sha256 `b87487fc…33bf74`.
+My test case: 1,102 commits, 4,598 sessions + 521 subagents (1,813 MB as your
+uploader reports it). Tested against `upload.sh` sha256 `b87487fc…33bf74`.
 
 **1. Silent commit truncation — produces a wrong report, not a failed run**
 
@@ -49,6 +49,16 @@ with no error mentioning memory, which made it hard to diagnose.
 
 *Suggested fix:* pass an explicit `--memory` sized from the largest transcript
 found, and/or stream transcript parsing instead of slurping whole files.
+
+**3. Smaller thing: the time estimate has no basis in the machine it's running on**
+
+The run printed "Estimated time: ~87 minutes" for 4,598 sessions. That appears to
+be a function of session count alone — it doesn't account for how much of the LLM
+cache is already warm, which your own output says is the dominant factor
+("reruns typically hit 95%+ cache and finish in minutes"). A first run and a
+re-run of the same repo quote the same number. Not a bug, but it made it hard to
+tell whether a long-running job was progressing or wedged, which is what prompted
+me to start digging in the first place.
 
 **Workaround I built**
 

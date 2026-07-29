@@ -56,6 +56,12 @@ SAFETY_FACTOR="${SAFETY_FACTOR:-1.5}"
 
 # ── measure: git ─────────────────────────────────────────────────────────────
 commits=$(git -C "$REPO" rev-list --count HEAD 2>/dev/null || echo 0)
+# The uploader applies `git log -$COMMIT_LIMIT $since_flag`, i.e. the cap acts on the
+# commits INSIDE the --since window, not on all history. Model that: default window is
+# 30d unless PAXEL_SINCE overrides. Verified 2026-07-29 against a real run that reported
+# "382 author-filtered commits" — exactly this repo's 30-day count, not its 1102 total.
+SINCE_WINDOW="${PAXEL_SINCE:-30 days ago}"
+commits_in_window=$(git -C "$REPO" rev-list --count --since="$SINCE_WINDOW" HEAD 2>/dev/null || echo 0)
 tracked=$(git -C "$REPO" ls-files 2>/dev/null | wc -l | tr -d ' ')
 
 # ── measure: transcripts ─────────────────────────────────────────────────────
@@ -85,9 +91,22 @@ fi
 
 # ── measure: docker ceiling ──────────────────────────────────────────────────
 docker_mem=0
-if command -v docker >/dev/null 2>&1; then
+docker_disk_avail=0; docker_disk_pct=""
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   docker_mem=$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)
+  # DISK inside the Docker VM — NOT host disk. The analysis merges every session
+  # into container /tmp; when the VM's overlay fills, the run dies with
+  # `Errno::ENOSPC: No space left on device` partway through, even with hundreds
+  # of GB free on the host. Observed 2026-07-29: VM 23.4G/23.5G used (100%),
+  # host 204G free. This is the failure the other checks do NOT catch.
+  _df=$(docker run --rm --quiet alpine df -Pk /tmp 2>/dev/null | tail -1 || true)
+  if [ -n "$_df" ]; then
+    docker_disk_avail=$(echo "$_df" | awk '{print $4*1024}')
+    docker_disk_pct=$(echo "$_df" | awk '{print $5}')
+  fi
 fi
+# Merge scratch needs roughly the transcript volume again, plus headroom.
+disk_need=$(awk -v b="$t_bytes" 'BEGIN{printf "%.0f", b*1.5}')
 
 # ── derive: required memory ──────────────────────────────────────────────────
 peak_one=$(awk -v b="$t_max" -v m="$JQ_RSS_MULTIPLIER" 'BEGIN{printf "%.0f", b*m}')
@@ -101,10 +120,12 @@ hb() { awk -v b="$1" 'BEGIN{ s="B KB MB GB TB"; split(s,u," "); i=1;
 # ── verdicts ─────────────────────────────────────────────────────────────────
 fail=0
 truncates=0; oom=0
-[ "$commits" -gt "$STOCK_COMMIT_LIMIT" ] && { truncates=1; fail=1; }
+[ "$commits_in_window" -gt "$STOCK_COMMIT_LIMIT" ] && { truncates=1; fail=1; }
 if [ "$docker_mem" -gt 0 ] && [ "$need" -gt "$docker_mem" ]; then oom=1; fail=1; fi
+nospc=0
+if [ "$docker_disk_avail" -gt 0 ] && [ "$disk_need" -gt "$docker_disk_avail" ]; then nospc=1; fail=1; fi
 
-rec_commit_limit=$(( commits + 200 ))
+rec_commit_limit=$(( commits_in_window + 200 ))
 rec_mem_gb=$(awk -v n="$need_gb" 'BEGIN{ v=int(n+0.999); if(v<4) v=4; print v }')
 
 if [ "$JSON" = "1" ]; then
@@ -112,9 +133,12 @@ if [ "$JSON" = "1" ]; then
   printf '  "repo": "%s",\n' "$REPO"
   printf '  "commits": %s,\n  "commit_limit": %s,\n  "will_truncate": %s,\n' \
          "$commits" "$STOCK_COMMIT_LIMIT" "$([ $truncates = 1 ] && echo true || echo false)"
-  printf '  "dropped_commits": %s,\n' "$([ $truncates = 1 ] && echo $((commits-STOCK_COMMIT_LIMIT)) || echo 0)"
+  printf '  "commits_in_since_window": %s,\n  "since_window": "%s",\n' "$commits_in_window" "$SINCE_WINDOW"
+  printf '  "dropped_commits": %s,\n' "$([ $truncates = 1 ] && echo $((commits_in_window-STOCK_COMMIT_LIMIT)) || echo 0)"
   printf '  "scope": "%s",\n  "projects_scanned": %s,\n  "transcripts": %s,\n  "transcript_bytes": %s,\n  "largest_bytes": %s,\n' \
          "$([ "$SCOPE_ALL" = 1 ] && echo all_projects || echo this_project)" "$t_projects" "$t_count" "$t_bytes" "$t_max"
+  printf '  "docker_disk_avail_bytes": %s,\n  "disk_need_bytes": %s,\n  "will_enospc": %s,\n' \
+         "$docker_disk_avail" "$disk_need" "$([ $nospc = 1 ] && echo true || echo false)"
   printf '  "docker_mem_bytes": %s,\n  "required_mem_bytes": %s,\n  "will_oom": %s,\n' \
          "$docker_mem" "$need" "$([ $oom = 1 ] && echo true || echo false)"
   printf '  "recommended_commit_limit": %s,\n  "recommended_memory_gb": %s\n' \
@@ -124,10 +148,11 @@ else
   echo "paxel-preflight — $REPO"
   echo
   echo "  git"
-  echo "    commits              : $commits"
+  echo "    commits (all history): $commits"
+  echo "    commits in --since   : $commits_in_window   [window: $SINCE_WINDOW — the cap applies HERE]"
   echo "    tracked files        : $tracked"
   if [ "$truncates" = 1 ]; then
-    echo "    COMMIT_LIMIT ($STOCK_COMMIT_LIMIT)  : ✗ SILENT TRUNCATION — $((commits-STOCK_COMMIT_LIMIT)) commits dropped, run still reports success"
+    echo "    COMMIT_LIMIT ($STOCK_COMMIT_LIMIT)  : ✗ TRUNCATION — $((commits_in_window-STOCK_COMMIT_LIMIT)) in-window commits dropped from the numstat detail"
   else
     echo "    COMMIT_LIMIT ($STOCK_COMMIT_LIMIT)  : ok"
   fi
@@ -153,11 +178,28 @@ else
     echo "    verdict              : ok"
   fi
   echo
+  echo "  docker disk (inside the VM — not your host disk)"
+  if [ "$docker_disk_avail" -gt 0 ]; then
+    echo "    available            : $(hb "$docker_disk_avail")${docker_disk_pct:+  (${docker_disk_pct} used)}"
+    echo "    merge scratch needs  : ~$(hb "$disk_need")   [1.5x transcript volume]"
+    if [ "$nospc" = 1 ]; then
+      echo "    verdict              : ✗ ENOSPC RISK — run dies with 'No space left on device' mid-merge"
+    else
+      echo "    verdict              : ok"
+    fi
+  else
+    echo "    available            : (docker not running — skipped)"
+  fi
+  echo
   if [ "$fail" = 1 ]; then
     echo "  ── RUN WITH THESE OVERRIDES ─────────────────────────────────────"
     [ "$truncates" = 1 ] && echo "    export COMMIT_LIMIT=$rec_commit_limit"
     [ "$oom" = 1 ]       && echo "    export PAXEL_DOCKER_MEMORY=${rec_mem_gb}g   # needs a uploader that honors it — see paxel-chunk"
     [ "$oom" = 1 ]       && echo "    # and raise Docker Desktop → Settings → Resources → Memory to ≥ ${rec_mem_gb} GB"
+    if [ "$nospc" = 1 ]; then
+      echo "    docker image prune -af --filter until=24h && docker builder prune -af"
+      echo "    # then re-check; if still short, raise Docker Desktop → Resources → Disk image size"
+    fi
     echo
     echo "  Or shard the transcripts first (no Docker memory change needed):"
     echo "    paxel-chunk --transcript-dir '$TDIR' --max-mb 25"
