@@ -97,9 +97,18 @@ echo "$out" | grep -q "clear to run" && ok "prints clear-to-run verdict" || bad 
 PAXEL_TRANSCRIPT_DIR="$TMP/tdir" "$BIN/paxel-preflight" --repo "$TMP/repo" --json 2>/dev/null | jq -e . >/dev/null 2>&1 \
   && ok "--json emits valid JSON" || bad "--json output is not valid JSON"
 
-# 12. truncation is detected when commits exceed the cap
-out2=$(PAXEL_TRANSCRIPT_DIR="$TMP/tdir" STOCK_COMMIT_LIMIT=0 "$BIN/paxel-preflight" --repo "$TMP/repo" 2>&1) || true
-echo "$out2" | grep -q "SILENT TRUNCATION" && ok "detects commit truncation" || bad "failed to detect truncation"
+# 12. truncation is detected when IN-WINDOW commits exceed the cap.
+#     The cap applies inside the --since window (verified against a real run), so the
+#     fixture commit must fall inside it for this to fire.
+out2=$(PAXEL_TRANSCRIPT_DIR="$TMP/tdir" STOCK_COMMIT_LIMIT=0 PAXEL_SINCE="10 years ago" \
+       "$BIN/paxel-preflight" --repo "$TMP/repo" 2>&1) || true
+echo "$out2" | grep -q "TRUNCATION" && ok "detects in-window commit truncation" || bad "failed to detect truncation"
+
+# 12b. a commit OUTSIDE the --since window must NOT trip the cap (the over-warning
+#      regression this replaced: comparing against total history instead of the window)
+out3=$(PAXEL_TRANSCRIPT_DIR="$TMP/tdir" STOCK_COMMIT_LIMIT=0 PAXEL_SINCE="1 second ago" \
+       "$BIN/paxel-preflight" --repo "$TMP/repo" 2>&1) || true
+echo "$out3" | grep -q "TRUNCATION" && bad "over-warns on out-of-window commits" || ok "no truncation warning outside the --since window"
 
 # 13. non-repo is rejected cleanly
 PAXEL_TRANSCRIPT_DIR="$TMP/tdir" "$BIN/paxel-preflight" --repo "$TMP" >/dev/null 2>&1 && rc2=0 || rc2=$?
