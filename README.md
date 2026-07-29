@@ -8,7 +8,7 @@ Nothing here forks or replaces Paxel's analysis — `paxel-run` downloads
 *inputs* so the run finishes.
 
 ```bash
-git clone https://github.com/<you>/paxel-largerepo
+git clone https://github.com/abhinaykrupa/paxel-largerepo
 export PATH="$PWD/paxel-largerepo/bin:$PATH"
 
 paxel-preflight              # will my repo complete? what do I need to change?
@@ -80,26 +80,32 @@ stock limits and prints the exact overrides needed.
 ```
 $ paxel-preflight
   git
-    commits              : 1102
-    COMMIT_LIMIT (1000)  : ✗ SILENT TRUNCATION — 102 commits dropped
-  transcripts
+    commits (all history): 1102
+    commits in --since   : 382   [window: 30 days ago — the cap applies HERE]
+    COMMIT_LIMIT (1000)  : ok
+  transcripts  (this project — what a default run analyzes)
     files                : 4578
-    total                : 950.4 MB
+    total                : 950.8 MB
     largest              : 184.9 MB
   memory
     docker ceiling       : 5.8 GB
     peak jq RSS (1 file) : 573.2 MB   [3.1x largest transcript]
     required             : 3.4 GB
     verdict              : ok
+  docker disk (inside the VM — not your host disk)
+    available            : 4.3 GB  (81% used)
+    merge scratch needs  : ~1.4 GB   [1.5x transcript volume]
+    verdict              : ok
 
-  ── RUN WITH THESE OVERRIDES ───────────
-    export COMMIT_LIMIT=1302
+  ✓ clear to run — stock uploader should complete on this repo.
 ```
 
-`--json` for CI. Exit `0` = clear to run, `1` = will truncate or OOM, `2` = usage.
+`--json` for CI. Exit `0` = clear to run, `1` = will truncate / OOM / ENOSPC,
+`2` = usage. `--all-projects` models an `upload.sh --all` run.
 
-It only reports OOM risk when your *actual* Docker ceiling is too low — on a
-5.8 GB machine it says `ok`, because it is.
+It reports a risk only when your *actual* limits are too low — on a 5.8 GB
+machine with 4.3 GB of container disk free it says `ok`, because it is. A tool
+that always finds something wrong is a tool nobody reads.
 
 ### `paxel-chunk` — shard oversized transcripts
 
@@ -148,7 +154,7 @@ YC's logic.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/paxel-largerepo
+git clone https://github.com/abhinaykrupa/paxel-largerepo
 export PATH="$PWD/paxel-largerepo/bin:$PATH"   # or symlink into ~/.local/bin
 ```
 
@@ -158,24 +164,32 @@ No language runtime, no package manager, no install step.
 ## Tests
 
 ```bash
-./test/run_tests.sh      # 14 tests, no network, no Docker, no uploads
+./test/run_tests.sh      # 15 tests, no network, no Docker, no uploads
 ```
 
 Covers the lossless round-trip, originals-untouched, shard validity, provenance
-headers, size caps, idempotency, truncation detection, and JSON output validity.
+headers, size caps, idempotency, in-window truncation detection (and the
+out-of-window case that must NOT warn), and JSON output validity.
 
 ## Suggested upstream fixes
 
-If YC wants to fix this in `upload.sh` directly, the two minimal changes are:
+If YC fixes these in `upload.sh`, this repo mostly stops being necessary:
 
-1. **Warn on truncation.** When `rev-list --count` exceeds `COMMIT_LIMIT`, print
-   the number of dropped commits and mark the report partial. A wrong report is
-   worse than a slow one.
+1. **Check container disk before the merge.** `merge_agent_sessions!` fills
+   container `/tmp` and dies with a Ruby backtrace ~4 steps into an 87-minute
+   job. A pre-check — *"needs ~1.4 GB in container /tmp, 0 B available — try
+   `docker image prune -af`"* — turns a 20-minute mystery into a 2-second fix.
+   Related: the image pull failed on the same full disk but reported `Using
+   cached image (pull failed, may be offline)`, blaming the network.
 2. **Pass an explicit `--memory` to `docker run`,** sized from the largest
    transcript rather than inherited from the host default — and stream transcript
    parsing instead of whole-file slurping.
+3. **Optional:** factor cache state into the time estimate. "~87 minutes" keys off
+   session count, though a warm cache "finishes in minutes" per the tool's own
+   docs — which makes a slow run indistinguishable from a wedged one.
 
-Neither requires the tools in this repo; they'd make it unnecessary.
+The full report sent upstream is in
+[`docs/EMAIL_TO_PAXEL.md`](docs/EMAIL_TO_PAXEL.md).
 
 ## License
 
