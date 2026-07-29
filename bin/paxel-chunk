@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# paxel-chunk — shard oversized Claude Code transcripts so a memory-bounded
+# analysis pipeline can process them without an OOM kill.
+#
+# The problem
+# -----------
+# Transcripts are JSONL: one self-contained JSON object per line. Tools that read
+# them with `jq -s` (slurp) or an equivalent whole-file parse allocate the entire
+# file as an in-memory array. Measured with /usr/bin/time -l (jq 1.7, macOS arm64):
+#
+#     185 MB transcript  ->  573 MB peak RSS   (~3.1x)
+#
+# With no `--memory` flag on `docker run`, the container inherits Docker Desktop's
+# default (commonly 2 GB). A few large sessions in flight blows past it and the
+# container dies mid-pipeline.
+#
+# The fix
+# -------
+# JSONL shards losslessly on line boundaries. This splits any transcript above
+# --max-mb into `<name>.partNNN.jsonl` shards, each carrying a `_paxel_shard`
+# provenance object as its first line so a downstream consumer can regroup them.
+# Every original line is preserved byte-for-byte; nothing is summarized or dropped.
+#
+# SAFE BY DEFAULT: writes shards to an output directory and NEVER modifies or
+# deletes the originals. --in-place is not offered on purpose — transcripts are
+# your only record of a session.
+#
+# Usage:
+#   paxel-chunk --transcript-dir DIR [--out DIR] [--max-mb N] [--dry-run]
+#
+# Exit codes: 0 = ok (or nothing to do) · 2 = usage error
+set -Eeuo pipefail
+
+TDIR=""; OUT=""; MAX_MB=25; DRY=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --transcript-dir) TDIR="${2:?}"; shift 2 ;;
+    --out)            OUT="${2:?}";  shift 2 ;;
+    --max-mb)         MAX_MB="${2:?}"; shift 2 ;;
+    --dry-run)        DRY=1; shift ;;
+    -h|--help)        sed -n '2,30p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -n "$TDIR" ] && [ -d "$TDIR" ] || { echo "need --transcript-dir <existing dir>" >&2; exit 2; }
+OUT="${OUT:-$TDIR/.paxel-shards}"
+MAX_BYTES=$(( MAX_MB * 1024 * 1024 ))
+
+echo "paxel-chunk"
+echo "  source : $TDIR"
+echo "  out    : $OUT"
+echo "  max    : ${MAX_MB} MB/shard"
+[ "$DRY" = 1 ] && echo "  MODE   : dry-run (nothing written)"
+echo
+
+total=0; sharded=0; produced=0
+while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  total=$((total+1))
+  sz=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+  [ "$sz" -le "$MAX_BYTES" ] && continue
+
+  base=$(basename "$f" .jsonl)
+  lines=$(wc -l < "$f" | tr -d ' ')
+  # ceil(size / max) shards, then lines per shard so each lands under the cap
+  nshards=$(( (sz + MAX_BYTES - 1) / MAX_BYTES ))
+  per=$(( (lines + nshards - 1) / nshards ))
+  [ "$per" -lt 1 ] && per=1
+
+  printf '  %-46s %6s MB  %6s lines -> %s shards\n' \
+    "$base" "$((sz/1024/1024))" "$lines" "$nshards"
+  sharded=$((sharded+1)); produced=$((produced+nshards))
+  [ "$DRY" = 1 ] && continue
+
+  mkdir -p "$OUT"
+  # split on line boundaries; numeric suffixes; .jsonl extension
+  split -l "$per" -a 3 -d "$f" "$OUT/${base}.part" 2>/dev/null || {
+    echo "    ! split failed for $base" >&2; continue; }
+
+  i=0
+  for part in "$OUT/${base}.part"*; do
+    [ -f "$part" ] || continue
+    case "$part" in *.jsonl) continue ;; esac
+    dest="${part}.jsonl"
+    # prepend provenance so shards can be regrouped and audited
+    {
+      printf '{"_paxel_shard":{"source":"%s","shard":%d,"of":%d,"lines_per_shard":%d,"tool":"paxel-chunk"}}\n' \
+        "$(basename "$f")" "$i" "$nshards" "$per"
+      cat "$part"
+    } > "$dest"
+    rm -f "$part"
+    i=$((i+1))
+  done
+done < <(find "$TDIR" -maxdepth 1 -name '*.jsonl' 2>/dev/null)
+
+echo
+echo "  scanned : $total transcripts"
+echo "  sharded : $sharded  (produced $produced shards)"
+if [ "$sharded" = 0 ]; then
+  echo "  ✓ nothing exceeds ${MAX_MB} MB — no action needed"
+elif [ "$DRY" = 1 ]; then
+  echo "  re-run without --dry-run to write shards"
+else
+  echo "  ✓ originals untouched; shards in $OUT"
+fi

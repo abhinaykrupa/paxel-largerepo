@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# paxel-preflight — diagnose whether `paxel upload.sh` can complete on THIS repo,
+# before you spend 20 minutes finding out that it can't.
+#
+# Why this exists
+# ---------------
+# The stock Paxel uploader works well on typical repos and degrades badly on large
+# ones — and it degrades SILENTLY in one case, which is worse than crashing. Measured
+# on a real project (AAQuant: 1,102 commits, 4,578 transcripts, 1.4 GB):
+#
+#   1. COMMIT_LIMIT defaults to 1000. A 1,102-commit repo is analyzed on 1,000
+#      commits and reports success. 102 commits are dropped with no warning. The
+#      report is wrong, not absent — you cannot tell from the output.
+#   2. `docker run` is invoked with NO --memory flag, so the container inherits the
+#      Docker Desktop default. Per-session jq processing of a 185 MB transcript
+#      costs ~573 MB RSS (measured, /usr/bin/time -l). A handful of large sessions
+#      concurrently exceeds a 2 GB default and the container is OOM-killed
+#      mid-pipeline — the "it fails in the middle" symptom.
+#
+# This script measures your repo against those limits and prints the exact env
+# overrides to make the run succeed. It is READ-ONLY: no uploads, no Docker runs,
+# no network calls, no writes outside --report-dir.
+#
+# Usage:
+#   paxel-preflight [--repo PATH] [--report-dir DIR] [--json]
+#
+# Exit codes: 0 = clear to run · 1 = will truncate or crash (overrides printed) · 2 = usage error
+set -Eeuo pipefail
+
+REPO="${PWD}"
+REPORT_DIR=""
+JSON=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)       REPO="${2:?--repo needs a path}"; shift 2 ;;
+    --report-dir) REPORT_DIR="${2:?--report-dir needs a path}"; shift 2 ;;
+    --json)       JSON=1; shift ;;
+    -h|--help)    sed -n '2,30p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -d "$REPO/.git" ] || { echo "not a git repo: $REPO" >&2; exit 2; }
+
+# ── thresholds (mirror the stock script's real defaults) ─────────────────────
+STOCK_COMMIT_LIMIT="${STOCK_COMMIT_LIMIT:-1000}"
+# Bytes of transcript that empirically cost ~3.1x that in jq peak RSS.
+# 185 MB file -> 573 MB RSS measured on jq 1.7 (macOS arm64).
+JQ_RSS_MULTIPLIER="${JQ_RSS_MULTIPLIER:-3.1}"
+# How many sessions the pipeline may hold in flight at once (observed worst case).
+CONCURRENCY="${CONCURRENCY:-4}"
+SAFETY_FACTOR="${SAFETY_FACTOR:-1.5}"
+
+# ── measure: git ─────────────────────────────────────────────────────────────
+commits=$(git -C "$REPO" rev-list --count HEAD 2>/dev/null || echo 0)
+tracked=$(git -C "$REPO" ls-files 2>/dev/null | wc -l | tr -d ' ')
+
+# ── measure: transcripts ─────────────────────────────────────────────────────
+# Claude Code stores per-project transcripts under a path-slug directory.
+slug=$(printf '%s' "$REPO" | sed 's|/|-|g')
+TDIR="${PAXEL_TRANSCRIPT_DIR:-$HOME/.claude/projects/$slug}"
+
+t_count=0; t_bytes=0; t_max=0; t_max_file=""; t_over50=0
+if [ -d "$TDIR" ]; then
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    sz=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+    t_count=$((t_count+1)); t_bytes=$((t_bytes+sz))
+    [ "$sz" -gt "$t_max" ] && { t_max=$sz; t_max_file=$(basename "$f"); }
+    [ "$sz" -gt 52428800 ] && t_over50=$((t_over50+1))
+  done < <(find "$TDIR" -maxdepth 1 -name '*.jsonl' 2>/dev/null)
+fi
+
+# ── measure: docker ceiling ──────────────────────────────────────────────────
+docker_mem=0
+if command -v docker >/dev/null 2>&1; then
+  docker_mem=$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)
+fi
+
+# ── derive: required memory ──────────────────────────────────────────────────
+peak_one=$(awk -v b="$t_max" -v m="$JQ_RSS_MULTIPLIER" 'BEGIN{printf "%.0f", b*m}')
+need=$(awk -v p="$peak_one" -v c="$CONCURRENCY" -v s="$SAFETY_FACTOR" 'BEGIN{printf "%.0f", p*c*s}')
+need_gb=$(awk -v n="$need" 'BEGIN{printf "%.1f", n/1073741824}')
+have_gb=$(awk -v n="$docker_mem" 'BEGIN{printf "%.1f", n/1073741824}')
+
+hb() { awk -v b="$1" 'BEGIN{ s="B KB MB GB TB"; split(s,u," "); i=1;
+  while (b>=1024 && i<5){ b/=1024; i++ } printf "%.1f %s", b, u[i] }'; }
+
+# ── verdicts ─────────────────────────────────────────────────────────────────
+fail=0
+truncates=0; oom=0
+[ "$commits" -gt "$STOCK_COMMIT_LIMIT" ] && { truncates=1; fail=1; }
+if [ "$docker_mem" -gt 0 ] && [ "$need" -gt "$docker_mem" ]; then oom=1; fail=1; fi
+
+rec_commit_limit=$(( commits + 200 ))
+rec_mem_gb=$(awk -v n="$need_gb" 'BEGIN{ v=int(n+0.999); if(v<4) v=4; print v }')
+
+if [ "$JSON" = "1" ]; then
+  printf '{\n'
+  printf '  "repo": "%s",\n' "$REPO"
+  printf '  "commits": %s,\n  "commit_limit": %s,\n  "will_truncate": %s,\n' \
+         "$commits" "$STOCK_COMMIT_LIMIT" "$([ $truncates = 1 ] && echo true || echo false)"
+  printf '  "dropped_commits": %s,\n' "$([ $truncates = 1 ] && echo $((commits-STOCK_COMMIT_LIMIT)) || echo 0)"
+  printf '  "transcripts": %s,\n  "transcript_bytes": %s,\n  "largest_bytes": %s,\n' \
+         "$t_count" "$t_bytes" "$t_max"
+  printf '  "docker_mem_bytes": %s,\n  "required_mem_bytes": %s,\n  "will_oom": %s,\n' \
+         "$docker_mem" "$need" "$([ $oom = 1 ] && echo true || echo false)"
+  printf '  "recommended_commit_limit": %s,\n  "recommended_memory_gb": %s\n' \
+         "$rec_commit_limit" "$rec_mem_gb"
+  printf '}\n'
+else
+  echo "paxel-preflight — $REPO"
+  echo
+  echo "  git"
+  echo "    commits              : $commits"
+  echo "    tracked files        : $tracked"
+  if [ "$truncates" = 1 ]; then
+    echo "    COMMIT_LIMIT ($STOCK_COMMIT_LIMIT)  : ✗ SILENT TRUNCATION — $((commits-STOCK_COMMIT_LIMIT)) commits dropped, run still reports success"
+  else
+    echo "    COMMIT_LIMIT ($STOCK_COMMIT_LIMIT)  : ok"
+  fi
+  echo
+  echo "  transcripts  ($TDIR)"
+  echo "    files                : $t_count"
+  echo "    total                : $(hb "$t_bytes")"
+  echo "    largest              : $(hb "$t_max")${t_max_file:+  ($t_max_file)}"
+  echo "    files > 50 MB        : $t_over50"
+  echo
+  echo "  memory"
+  echo "    docker ceiling       : ${have_gb} GB"
+  echo "    peak jq RSS (1 file) : $(hb "$peak_one")   [${JQ_RSS_MULTIPLIER}x largest transcript]"
+  echo "    required (x$CONCURRENCY conc, x$SAFETY_FACTOR safety) : ${need_gb} GB"
+  if [ "$oom" = 1 ]; then
+    echo "    verdict              : ✗ OOM RISK — container will be killed mid-pipeline"
+  else
+    echo "    verdict              : ok"
+  fi
+  echo
+  if [ "$fail" = 1 ]; then
+    echo "  ── RUN WITH THESE OVERRIDES ─────────────────────────────────────"
+    [ "$truncates" = 1 ] && echo "    export COMMIT_LIMIT=$rec_commit_limit"
+    [ "$oom" = 1 ]       && echo "    export PAXEL_DOCKER_MEMORY=${rec_mem_gb}g   # needs a uploader that honors it — see paxel-chunk"
+    [ "$oom" = 1 ]       && echo "    # and raise Docker Desktop → Settings → Resources → Memory to ≥ ${rec_mem_gb} GB"
+    echo
+    echo "  Or shard the transcripts first (no Docker memory change needed):"
+    echo "    paxel-chunk --transcript-dir '$TDIR' --max-mb 25"
+  else
+    echo "  ✓ clear to run — stock uploader should complete on this repo."
+  fi
+fi
+
+if [ -n "$REPORT_DIR" ]; then
+  mkdir -p "$REPORT_DIR"
+  "$0" --repo "$REPO" --json > "$REPORT_DIR/preflight.json"
+  echo "  report -> $REPORT_DIR/preflight.json"
+fi
+
+exit $fail

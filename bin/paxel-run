@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# paxel-run — run the official Paxel uploader with large-repo-safe settings.
+#
+# This is a THIN WRAPPER, not a fork. It downloads the official upload.sh from
+# YC, verifies it, exports the environment overrides that a large repo needs, and
+# execs it unmodified. All analysis, auth, and upload logic stays YC's.
+#
+# What it changes (and why)
+# -------------------------
+#   COMMIT_LIMIT           default 1000 -> repo commit count + headroom.
+#                          Above the default the stock run analyzes the newest
+#                          1000 commits and reports SUCCESS; the rest are dropped
+#                          silently. That is a wrong report, not a missing one.
+#   PAXEL_GIT_TIMEOUT      default 120s -> 600s for very large histories.
+#   Transcript sharding    optional pre-pass (paxel-chunk) so per-session parsing
+#                          stays under the container memory ceiling.
+#
+# It does NOT change what is uploaded, redacted, or scored.
+#
+# Usage:
+#   paxel-run [--repo PATH] [--shard] [--max-mb N] [--dry-run] [-- <extra args to upload.sh>]
+#
+#   --dry-run   preflight + print the exact command; download but do NOT execute.
+#
+# Requires: docker (running), curl, git, jq.
+set -Eeuo pipefail
+
+_sha256() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d" " -f1;
+  elif command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d" " -f1;
+  else echo "no sha256 tool (need shasum or sha256sum)" >&2; return 1; fi; }
+
+REPO="$PWD"; SHARD=0; MAX_MB=25; DRY=0; PASSTHRU=()
+UPLOAD_URL="${PAXEL_UPLOAD_URL:-https://paxel.ycombinator.com/upload.sh}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)     REPO="${2:?}"; shift 2 ;;
+    --shard)    SHARD=1; shift ;;
+    --max-mb)   MAX_MB="${2:?}"; shift 2 ;;
+    --dry-run)  DRY=1; shift ;;
+    --)         shift; PASSTHRU=("$@"); break ;;
+    -h|--help)  sed -n '2,28p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+[ -d "$REPO/.git" ] || { echo "not a git repo: $REPO" >&2; exit 2; }
+
+echo "═══ paxel-run ═══"
+echo
+
+# ── 1. preflight ─────────────────────────────────────────────────────────────
+echo "▸ preflight"
+set +e
+"$HERE/paxel-preflight" --repo "$REPO"
+pf=$?
+set -e
+echo
+
+# ── 2. derive overrides from the repo itself ─────────────────────────────────
+commits=$(git -C "$REPO" rev-list --count HEAD)
+export COMMIT_LIMIT="${COMMIT_LIMIT:-$(( commits + 200 ))}"
+export PAXEL_GIT_TIMEOUT="${PAXEL_GIT_TIMEOUT:-600}"
+
+echo "▸ overrides"
+echo "    COMMIT_LIMIT=$COMMIT_LIMIT        (repo has $commits commits; stock default is 1000)"
+echo "    PAXEL_GIT_TIMEOUT=$PAXEL_GIT_TIMEOUT"
+echo
+
+# ── 3. optional transcript sharding ──────────────────────────────────────────
+if [ "$SHARD" = "1" ]; then
+  slug=$(printf '%s' "$REPO" | sed 's|/|-|g')
+  tdir="${PAXEL_TRANSCRIPT_DIR:-$HOME/.claude/projects/$slug}"
+  echo "▸ sharding transcripts > ${MAX_MB} MB"
+  "$HERE/paxel-chunk" --transcript-dir "$tdir" --max-mb "$MAX_MB" || true
+  echo
+fi
+
+# ── 4. fetch the OFFICIAL uploader (never vendored — always current) ─────────
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+echo "▸ fetching official uploader"
+echo "    $UPLOAD_URL"
+curl -fsSL --max-time 120 "$UPLOAD_URL" -o "$tmp/upload.sh" || {
+  echo "    ! download failed" >&2; exit 1; }
+sz=$(stat -f%z "$tmp/upload.sh" 2>/dev/null || stat -c%s "$tmp/upload.sh")
+sha=$(_sha256 < "$tmp/upload.sh")
+echo "    bytes  : $sz"
+echo "    sha256 : $sha"
+head -1 "$tmp/upload.sh" | grep -q '^#!/bin/bash' || {
+  echo "    ! not a bash script — refusing to execute" >&2; exit 1; }
+echo "    ✓ looks like the expected uploader"
+echo
+
+# ── 5. run it (or show what would run) ───────────────────────────────────────
+if [ "$DRY" = "1" ]; then
+  echo "▸ dry-run — NOT executing. To run for real:"
+  echo
+  echo "    cd '$REPO' && \\"
+  echo "      COMMIT_LIMIT=$COMMIT_LIMIT PAXEL_GIT_TIMEOUT=$PAXEL_GIT_TIMEOUT \\"
+  echo "      bash <(curl -fsSL $UPLOAD_URL)"
+  echo
+  echo "  (or simply: paxel-run --repo '$REPO'${SHARD:+ --shard})"
+  exit 0
+fi
+
+command -v docker >/dev/null 2>&1 || { echo "docker not found — the uploader needs it" >&2; exit 1; }
+docker info >/dev/null 2>&1 || { echo "docker is installed but not running — start Docker Desktop" >&2; exit 1; }
+
+echo "▸ running official uploader (browser sign-in may open)"
+echo
+cd "$REPO"
+exec bash "$tmp/upload.sh" "${PASSTHRU[@]}"
