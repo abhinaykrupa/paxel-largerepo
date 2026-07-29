@@ -30,12 +30,14 @@ set -Eeuo pipefail
 REPO="${PWD}"
 REPORT_DIR=""
 JSON=0
+SCOPE_ALL=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)       REPO="${2:?--repo needs a path}"; shift 2 ;;
     --report-dir) REPORT_DIR="${2:?--report-dir needs a path}"; shift 2 ;;
     --json)       JSON=1; shift ;;
+    --all-projects)   SCOPE_ALL=1; shift ;;   # model a `upload.sh --all` run
     -h|--help)    sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -61,15 +63,24 @@ tracked=$(git -C "$REPO" ls-files 2>/dev/null | wc -l | tr -d ' ')
 slug=$(printf '%s' "$REPO" | sed 's|/|-|g')
 TDIR="${PAXEL_TRANSCRIPT_DIR:-$HOME/.claude/projects/$slug}"
 
-t_count=0; t_bytes=0; t_max=0; t_max_file=""; t_over50=0
-if [ -d "$TDIR" ]; then
+# SCOPE (verified against a real run, 2026-07-29): by DEFAULT the uploader
+# auto-detects ONE project from your cwd and analyzes only its sessions
+# ("Auto-detected project: aaquant ... Found 4598 sessions"). It scans every
+# project only when invoked with `--all`. So the default preflight scope is this
+# repo's transcript dir; pass --all-projects to model an `--all` run.
+SCAN_ROOT="$TDIR"; SCAN_DEPTH=1
+if [ "$SCOPE_ALL" = "1" ]; then SCAN_ROOT="$(dirname "$TDIR")"; SCAN_DEPTH=2; fi
+
+t_count=0; t_bytes=0; t_max=0; t_max_file=""; t_over50=0; t_projects=0
+if [ -d "$SCAN_ROOT" ]; then
   while IFS= read -r f; do
     [ -f "$f" ] || continue
     sz=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
     t_count=$((t_count+1)); t_bytes=$((t_bytes+sz))
-    [ "$sz" -gt "$t_max" ] && { t_max=$sz; t_max_file=$(basename "$f"); }
+    if [ "$sz" -gt "$t_max" ]; then t_max=$sz; t_max_file="$(basename "$(dirname "$f")")/$(basename "$f")"; fi
     [ "$sz" -gt 52428800 ] && t_over50=$((t_over50+1))
-  done < <(find "$TDIR" -maxdepth 1 -name '*.jsonl' 2>/dev/null)
+  done < <(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" -name '*.jsonl' 2>/dev/null)
+  t_projects=$(find "$SCAN_ROOT" -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
 fi
 
 # ── measure: docker ceiling ──────────────────────────────────────────────────
@@ -102,8 +113,8 @@ if [ "$JSON" = "1" ]; then
   printf '  "commits": %s,\n  "commit_limit": %s,\n  "will_truncate": %s,\n' \
          "$commits" "$STOCK_COMMIT_LIMIT" "$([ $truncates = 1 ] && echo true || echo false)"
   printf '  "dropped_commits": %s,\n' "$([ $truncates = 1 ] && echo $((commits-STOCK_COMMIT_LIMIT)) || echo 0)"
-  printf '  "transcripts": %s,\n  "transcript_bytes": %s,\n  "largest_bytes": %s,\n' \
-         "$t_count" "$t_bytes" "$t_max"
+  printf '  "scope": "%s",\n  "projects_scanned": %s,\n  "transcripts": %s,\n  "transcript_bytes": %s,\n  "largest_bytes": %s,\n' \
+         "$([ "$SCOPE_ALL" = 1 ] && echo all_projects || echo this_project)" "$t_projects" "$t_count" "$t_bytes" "$t_max"
   printf '  "docker_mem_bytes": %s,\n  "required_mem_bytes": %s,\n  "will_oom": %s,\n' \
          "$docker_mem" "$need" "$([ $oom = 1 ] && echo true || echo false)"
   printf '  "recommended_commit_limit": %s,\n  "recommended_memory_gb": %s\n' \
@@ -121,7 +132,12 @@ else
     echo "    COMMIT_LIMIT ($STOCK_COMMIT_LIMIT)  : ok"
   fi
   echo
-  echo "  transcripts  ($TDIR)"
+  if [ "$SCOPE_ALL" = "1" ]; then
+    echo "  transcripts  (ALL projects — models an \`upload.sh --all\` run)"
+    echo "    projects scanned     : $t_projects"
+  else
+    echo "  transcripts  (this project — what a default run analyzes)"
+  fi
   echo "    files                : $t_count"
   echo "    total                : $(hb "$t_bytes")"
   echo "    largest              : $(hb "$t_max")${t_max_file:+  ($t_max_file)}"
