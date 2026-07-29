@@ -17,27 +17,31 @@ paxel-run --shard            # run the official uploader with safe settings
 
 ---
 
-## The two failure modes
+## The failure modes
 
-Both were found and measured on a real project — **AAQuant**: 1,102 commits,
-4,578 transcripts, 950 MB of session data.
+Found by **running** `upload.sh` on a real project (4,598 sessions + 521
+subagents, 1,813 MB) — not by reading it. See
+[`docs/RUN_LOG_2026-07-29.md`](docs/RUN_LOG_2026-07-29.md) for the full log,
+including two claims the real run disproved.
 
-### 1. Silent commit truncation (the dangerous one)
-
-`upload.sh` uses `COMMIT_LIMIT:-1000`. A repo with more commits is analyzed on
-the newest 1,000 — and the run **reports success**.
+### 1. ENOSPC in the merge step — the one that actually broke the run
 
 ```
-commits              : 1102
-COMMIT_LIMIT (1000)  : ✗ 102 commits dropped, run still reports success
+Errno::ENOSPC: No space left on device @ dir_s_mkdir - /tmp/paxel-merged-…
+/rails/lib/analyze_local_merge.rb:69 … merge_agent_sessions!
+Analysis failed (exit code: 1)
 ```
 
-You get a report that looks complete and isn't. There is no warning in the
-output, and no way to tell from the report that history was cut. For a tool whose
-purpose is measuring engineering behavior over time, silently analyzing 91% of
-the history is a correctness bug, not a performance one.
+The merge writes every session into container `/tmp`. The **Docker VM disk was
+100% full (23.4/23.5 GB)** while the **host had 204 GB free**.
 
-### 2. Unbounded per-session memory → OOM mid-pipeline
+Every instinct points the wrong way: host `df` looks fine, memory looks fine, the
+repo looks fine. The full disk is in a VM most users never inspect, and the error
+lands ~4 steps into a job advertised at ~87 minutes.
+
+`paxel-preflight` catches it by running `df` **inside** a throwaway container.
+
+### 2. Unbounded per-session memory
 
 The uploader's `docker run` passes **no `--memory` flag**, so the container
 inherits the Docker Desktop default (commonly 2 GB). Transcript parsing is
@@ -50,9 +54,19 @@ whole-file, and JSON parsing costs several times the file size in RAM:
 
 *Measured with `/usr/bin/time -l`, jq 1.7, macOS arm64.*
 
-Several large sessions in flight exceed a 2 GB ceiling and the container is
-OOM-killed partway through — the "it fails in the middle" symptom, with no clear
-error pointing at memory.
+On a stock 2 GB Docker install, several large sessions in flight would be tight.
+**Honest caveat:** at the 5.8 GB ceiling on the test machine this did *not* cause
+the failure, and preflight correctly reports `ok` rather than manufacturing a
+problem.
+
+### What is NOT a bug (corrected after running it)
+
+An earlier version of this README claimed `COMMIT_LIMIT=1000` silently truncated
+history. Running it disproved that: the cap applies **inside the `--since`
+window** (`git log -$COMMIT_LIMIT $since_flag`), and the true total is still
+recorded separately via `git rev-list --count HEAD`. A repo only trips it with
+>1,000 commits in the window. Preflight now models this correctly instead of
+over-warning.
 
 ---
 

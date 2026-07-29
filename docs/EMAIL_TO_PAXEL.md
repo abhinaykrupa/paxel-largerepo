@@ -1,91 +1,108 @@
 # Email to the Paxel team
 
-Draft below. Two bug reports with reproductions, plus an MIT-licensed workaround
-repo. Tone is "here's a bug and a reproduction," not "here's my replacement" —
-the suggested upstream fixes would make the repo unnecessary, and the email says so.
+Every claim below was verified by running the tool, not by reading it. Where the
+real run disproved something I'd inferred from the source, the email says so —
+that honesty is what makes the remaining findings worth their attention.
+
+**To:** paxel@ycombinator.com
 
 ---
 
-**Subject:** Paxel silently truncates history >1000 commits (+ OOM on large transcripts) — repro + workaround
+**Subject:** upload.sh dies with ENOSPC on large session sets — repro, root cause, and a preflight tool
 
 ---
 
 Hi Paxel team,
 
-I hit two issues running `upload.sh` on a large project and wanted to send them
-over with reproductions. One of them produces a wrong report rather than a failed
-run, which seems worth prioritising.
+I ran `upload.sh` on a large project, it failed partway through, and I dug into
+why. Sending the findings in case they're useful — one is a real bug with an easy
+fix, and I've open-sourced the preflight tool I built while debugging it.
 
-My test case: 1,102 commits, 4,598 sessions + 521 subagents (1,813 MB as your
-uploader reports it). Tested against `upload.sh` sha256 `b87487fc…33bf74`.
+Setup: 4,598 sessions + 521 subagents (1,813 MB as your uploader reports it),
+1,102-commit repo. macOS arm64, Docker 29.5.2. Tested against `upload.sh` sha256
+`b87487fc7bc420e88ff4baeae4956cb6e2a7b053e44b42f20a3527476733bf74`.
 
-**1. Silent commit truncation — produces a wrong report, not a failed run**
+## The bug: ENOSPC in the merge step, ~4 steps into an 87-minute job
 
-`COMMIT_LIMIT` defaults to 1000. On a repo with more commits, the run analyzes
-the newest 1,000, completes normally, and reports success. The remaining commits
-are dropped with no warning in the output and nothing in the report indicating
-history was cut.
+```
+Preparing local database...
+bin/rails aborted!
+Errno::ENOSPC: No space left on device @ dir_s_mkdir - /tmp/paxel-merged-ea089dce
+/rails/lib/analyze_local_merge.rb:69:in 'block in AnalyzeLocalMerge.merge_agent_sessions!'
+Analysis failed for aaquant (exit code: 1).
+```
 
-On my repo that's 102 commits (9% of history) missing from a report that looks
-complete. For a tool measuring engineering behavior over time, I think this is
-worth a warning at minimum — a user currently has no way to know their report is
-partial.
+`merge_agent_sessions!` writes every session into container `/tmp`. My Docker VM's
+disk was **23.4 GB of 23.5 GB used (100%)** — while the **host had 204 GB free**.
 
-*Suggested fix:* compare `git rev-list --count HEAD` against `COMMIT_LIMIT`, and
-if it exceeds, print the number of dropped commits and mark the report partial.
+What makes this a bad failure mode isn't the error, it's that every instinct
+points the wrong way. `df` on the host shows plenty of room. Memory is fine. The
+repo is fine. The full disk is inside a VM most users never inspect, and the
+failure lands deep into a job advertised at ~87 minutes.
 
-**2. Unbounded per-session memory → OOM kill mid-pipeline**
+Fix on my side was `docker image prune -af --filter until=24h && docker builder
+prune -af` — reclaimed 5.6 GB, and the rerun got past the merge and completed.
 
-`docker run` is invoked without a `--memory` flag, so the container inherits the
-Docker Desktop default (commonly 2 GB). Transcript parsing appears to be
-whole-file, and JSON parsing costs several times file size in RAM. Measured with
-`/usr/bin/time -l` (jq 1.7, macOS arm64):
+**Suggested fix:** before the merge, check free space in the container and fail
+fast with the numbers. Something like *"needs ~1.4 GB in container /tmp, 0 B
+available — try `docker image prune -af`"*. Failing in 2 seconds with a remedy
+beats failing in 20 minutes with a Ruby backtrace. A related symptom: the image
+pull failed on the same full disk but reported `Using cached image (pull failed,
+may be offline)` — blaming the network for a disk problem.
 
-    185 MB transcript  ->  573 MB peak RSS   (3.1x)
+## Two smaller things
 
-With several large sessions in flight this exceeds a 2 GB ceiling and the
-container is killed partway through. The symptom is a run that dies mid-pipeline
-with no error mentioning memory, which made it hard to diagnose.
+**Memory isn't bounded.** `docker run` is invoked with no `--memory`, so the
+container takes the Docker Desktop default (commonly 2 GB). Transcript parsing
+looks whole-file; I measured a 185 MB transcript costing **573 MB peak RSS**
+(3.1×, `/usr/bin/time -l`, jq 1.7). At a 5.8 GB ceiling this was fine and did
+*not* cause my failure — but on a stock 2 GB Docker install, several large
+sessions in flight would be tight. An explicit `--memory` sized from the largest
+transcript, or streaming instead of slurping, would close it.
 
-*Suggested fix:* pass an explicit `--memory` sized from the largest transcript
-found, and/or stream transcript parsing instead of slurping whole files.
+**The time estimate ignores cache state.** "~87 minutes" appears to key off
+session count alone, though your own output notes reruns typically hit 95%+ cache
+and "finish in minutes". It's minor, but it's what made a slow run
+indistinguishable from a wedged one — which is what sent me digging.
 
-**3. Smaller thing: the time estimate has no basis in the machine it's running on**
+## One thing I got wrong, in case it saves you time
 
-The run printed "Estimated time: ~87 minutes" for 4,598 sessions. That appears to
-be a function of session count alone — it doesn't account for how much of the LLM
-cache is already warm, which your own output says is the dominant factor
-("reruns typically hit 95%+ cache and finish in minutes"). A first run and a
-re-run of the same repo quote the same number. Not a bug, but it made it hard to
-tell whether a long-running job was progressing or wedged, which is what prompted
-me to start digging in the first place.
+Reading the source first, I thought `COMMIT_LIMIT=1000` was silently truncating
+history on repos with more commits. Running it showed that's wrong on two counts,
+and I'd rather correct it than have you chase it:
 
-**Workaround I built**
+1. The cap applies **inside the `--since` window** (`git log -$COMMIT_LIMIT
+   $since_flag`), not to all history. Your run reported "382 author-filtered
+   commits" — exactly my repo's 30-day count, not its 1,102 total. A repo only
+   trips the cap with >1,000 commits in the window.
+2. The true total **is** still recorded — `git rev-list --count HEAD >
+   ..._commit_count.txt` runs right above it. The numstat *detail* is capped; the
+   commit *count* isn't.
 
-https://github.com/abhinaykrupa/paxel-largerepo — MIT, 14 tests, CI on Ubuntu +
+So: not a bug. My preflight tool now models the window correctly instead of
+over-warning.
+
+## The tool
+
+https://github.com/abhinaykrupa/paxel-largerepo — MIT, 15 tests, CI on Ubuntu +
 macOS.
 
-Three bash tools that wrap the official uploader rather than forking it:
-
-- `paxel-preflight` — read-only; measures a repo against both limits and prints
-  the exact overrides needed. `--json` for CI.
+- `paxel-preflight` — read-only. Checks container disk (via `df` inside a
+  throwaway container), memory headroom, and the commit cap against the `--since`
+  window. Prints the exact remedy. `--json` for CI.
 - `paxel-chunk` — shards oversized JSONL transcripts on line boundaries with a
-  provenance header. Byte-identical round-trip verified in the test suite; never
+  provenance header. Byte-identical round-trip is asserted in the suite; never
   modifies originals.
-- `paxel-run` — derives `COMMIT_LIMIT` from the real commit count, raises
-  `PAXEL_GIT_TIMEOUT`, optionally shards, then downloads your `upload.sh` and
-  execs it **unmodified**. It changes nothing about what gets uploaded, redacted,
-  or scored.
+- `paxel-run` — thin wrapper: preflight, set overrides, then download your
+  `upload.sh` and exec it **unmodified**. It changes nothing about what's
+  uploaded, redacted, or scored.
 
-Measured effect of sharding on the same data: 66.1 MB → 11.4 MB peak RSS.
+This is a workaround, not a competing tool. If you add the pre-merge disk check
+upstream, most of it becomes unnecessary and I'll happily archive it. Happy to
+open a PR against `upload.sh` instead if you'd prefer the fix directly — just
+point me at the repo.
 
-To be clear about intent — this is a workaround, not a competing tool. If you
-fix the two items above upstream, my repo stops being necessary and I'll happily
-archive it. Happy to open a PR against `upload.sh` instead if you'd prefer the
-fixes directly; just point me at the right place.
-
-Thanks for building this — the analysis output is genuinely useful once it
-completes.
+Thanks for building this. The analysis is genuinely good once it gets through.
 
 Best,
 Abhi Gadikoppula
