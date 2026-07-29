@@ -106,7 +106,10 @@ echo "$out2" | grep -q "TRUNCATION" && ok "detects in-window commit truncation" 
 
 # 12b. a commit OUTSIDE the --since window must NOT trip the cap (the over-warning
 #      regression this replaced: comparing against total history instead of the window)
-out3=$(PAXEL_TRANSCRIPT_DIR="$TMP/tdir" STOCK_COMMIT_LIMIT=0 PAXEL_SINCE="1 second ago" \
+# A FUTURE date is unambiguous — no clock race. The fixture commit is always
+# older than "tomorrow", so the window must contain zero commits.
+_future=$(date -u -v+1d '+%Y-%m-%d' 2>/dev/null || date -u -d '+1 day' '+%Y-%m-%d')
+out3=$(PAXEL_TRANSCRIPT_DIR="$TMP/tdir" STOCK_COMMIT_LIMIT=0 PAXEL_SINCE="$_future" \
        "$BIN/paxel-preflight" --repo "$TMP/repo" 2>&1) || true
 echo "$out3" | grep -q "TRUNCATION" && bad "over-warns on out-of-window commits" || ok "no truncation warning outside the --since window"
 
